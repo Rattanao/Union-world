@@ -91,10 +91,13 @@ def extract_transit_phrase(txt):
        คำสำคัญ + ปลายทางจริง (คำ TO ตัวสุดท้ายก่อนเจอ VIA/BY/FROM หรือจบประโยค)."""
     if not txt:
         return ''
-    m = re.search(r'(IN\s*TRANSIT|TRANS\s?S?HIP(?:MENT)?)', txt, re.I)
+    txt = re.sub(r'\bLAO\s*P\.?\s*D\.?\s*R\.?', 'LAO PDR', txt, flags=re.I)   # จุดใน P.D.R. ไม่ใช่จบประโยค
+    # TRANSHIPMENT มาก่อนเสมอถ้ามีทั้งสองคำ (เช่น "SHIP'S SPARE PART IN TRANSIT FOR M/V ... TRANSSHIPMENT
+    # CARGO FROM BUSAN TO RABAUL") — ตรงกับกฎ CARGO MOVEMENT (3-TRANSHIPMENT) ที่ให้ TRANSHIPMENT ชนะ
+    m = re.search(r'TRANS[\s-]?S?HIP(?:MENT)?', txt, re.I) or re.search(r'IN\s*TRANSIT', txt, re.I)
     if not m:
         return re.sub(r'\s+', ' ', txt).strip()
-    kw = 'INTRANSIT' if 'TRANSIT' in m.group(1).upper().replace(' ', '') else 'TRANSHIPMENT'
+    kw = 'INTRANSIT' if 'TRANSIT' in m.group(0).upper().replace(' ', '') else 'TRANSHIPMENT'
     rest = txt[m.end():]
     tos = list(re.finditer(r'\bTO\s+([A-Za-z][A-Za-z,.\s]*?)(?=\s+(?:VIA|BY|FROM)\b|["\.\-]|$)', rest, re.I))
     if tos:
@@ -173,14 +176,20 @@ def check_dest_code(transit_text, dest_code_raw):
     return (actual == expected), expected, actual
 
 
-def check_movement(transit_text, dest_country, movement_manifest_raw, movement_enter_raw):
+TRANSHIP_RE = re.compile(r'TRANS[\s-]?S?HIP', re.I)
+
+
+def check_movement(transit_text, dest_country, movement_manifest_raw, movement_enter_raw, enter_transit_text=''):
     """กฎ 3) CARGO MOVEMENT — คืน (ok, expected_display, actual_code).
        ok=None: ไม่มี transit เลย (STATUS อื่น เช่น O-OTHER/5-CONSOLIDATE ถือว่าถูกต้องเสมอ ไม่ตรวจ).
        ok='review': ไปลาว แต่ไม่พบค่า CARGO MOVEMENT ใน ENTER ให้เทียบ — ต้องให้คนตรวจสอบเอง (ส้ม).
-       ไม่ใช่ลาว: ต้องเป็น '7-TRANSIT' เสมอ. ไปลาว: ต้องตรงกับที่ ENTER ระบุ (7 หรือ L) เท่านั้น."""
+       TRANSHIPMENT (พบใน MANIFEST หรือ ENTER ก็ตาม): ต้องเป็น '3-TRANSHIPMENT' เสมอ ทุกปลายทาง รวมลาว.
+       INTRANSIT ไม่ใช่ลาว: ต้องเป็น '7-TRANSIT' เสมอ. ไปลาว: ต้องตรงกับที่ ENTER ระบุ (7 หรือ L) เท่านั้น."""
+    mv = (movement_manifest_raw or '').strip().upper()
+    if TRANSHIP_RE.search(transit_text or '') or TRANSHIP_RE.search(enter_transit_text or ''):
+        return mv.startswith('3'), '3-TRANSHIPMENT', mv
     if not transit_text:
         return None, '', ''
-    mv = (movement_manifest_raw or '').strip().upper()
     if dest_country in LAOS_NAMES:
         exp = (movement_enter_raw or '').strip().upper()
         if not exp:
@@ -248,7 +257,7 @@ def compute_extra_checks(m, e):
         out['dest'] = {'ok': ok, 'text': txt, 'note': note}
 
     ok, exp, act = check_movement(m['transit'], dest_country, m.get('movement_raw', ''),
-                                   (e or {}).get('movement_raw', ''))
+                                   (e or {}).get('movement_raw', ''), (e or {}).get('transit_raw', ''))
     raw_mv = m.get('movement_raw') or ''
     ent_mv = (e or {}).get('movement_raw', '')
     if ok is None:
@@ -387,7 +396,7 @@ def same_detail(a, b):
        True = ตรงกัน ; False = ไม่ตรง (เตือน) ; None = ไม่มีข้อความทั้งคู่."""
     # 'CARGO MOVEMENT n' เป็นรหัสศุลกากร ไม่ใช่รายละเอียดสินค้า — ENTER ตัดออกจาก DESC แต่ MANIFEST บางไฟล์พิมพ์ไว้
     # ท้าย DESC ('*CARGO MOVEMENT 7*') จึงไม่นับในการเทียบ (ยังแสดงในเซลล์ตามต้นฉบับ)
-    mv = lambda s: re.sub(r'\*?\s*CARGO\s*MOVEMENT\s*[0-9A-Z\-]+\s*\*?', ' ', str(s or '').upper())
+    mv = lambda s: re.sub(r'\*?\s*CARGO\s*MOVEMENT\s*[:=]?\s*[0-9A-Z][0-9A-Z\-]*\s*\*?', ' ', str(s or '').upper())
     na = re.sub(r'[^A-Z0-9]', '', mv(a))
     nb = re.sub(r'[^A-Z0-9]', '', mv(b))
     if not na and not nb:
@@ -449,6 +458,23 @@ def detect_marks_col(rows):
     return counts.most_common(1)[0][0] if counts else 5
 
 
+# คอลัมน์ข้อมูลอื่นของ MANIFEST ก็เลื่อนได้เหมือน MARKS — เช่น MANIFEST ของ SAWASDEE SPICA 2610S (Union World
+# 2026-11-02) พิมพ์ PKGS/DESC ที่คอลัมน์ 6 (ปกติ 10), 1)…4) กฎเพิ่มเติมที่ 11 (ปกติ 15), KGM/MTQ ที่ 12 (ปกติ 16)
+# เดาจากข้อมูลจริงทีละคอลัมน์ ถ้าไม่พบแพทเทิร์นเลยใช้ค่าเดิม
+_DESC_COL_LINE_RE = re.compile(r'^[\d,]+\s+[A-Z]{2}\s*\(')            # '143 RO (ROLL(s))'
+_WT_COL_LINE_RE = re.compile(r'^[\d,]+\.?\d*\s*(KGM|MTQ)$', re.I)     # '6,953.000 KGM' / '16.000 MTQ'
+_RULE_COL_LINE_RE = re.compile(r'^[1-4]\)\s*(SHED|ประเทศ|CARGO\s*MOVEMENT|TAX\s*ID)', re.I)
+
+
+def _detect_col(rows, pat, default):
+    counts = Counter()
+    for row in rows:
+        for idx, v in enumerate(row):
+            if pat.match(str(v).strip()):
+                counts[idx] += 1
+    return counts.most_common(1)[0][0] if counts else default
+
+
 def _cell(row, i):
     if i >= len(row):
         return ''
@@ -504,11 +530,15 @@ def parse_manifest(path):
         rows = [sh.row_values(r) for r in range(sh.nrows)]
     BL_RE = detect_bl_prefix(rows)
     MARKS_COL = detect_marks_col(rows)
+    DESC_COL = _detect_col(rows, _DESC_COL_LINE_RE, 10)
+    WT_COL = _detect_col(rows, _WT_COL_LINE_RE, 16)
+    RULE_COL = _detect_col(rows, _RULE_COL_LINE_RE, 15)
 
     vessel = ''
     declared = {}   # ยอดรวมที่ MANIFEST ระบุเอง (GRAND TOTAL: ...) ถ้ามี
     MAN, i, n = {}, 0, len(rows)
     END = re.compile(r'^(PORT TOTAL|GRAND TOTAL|TOTAL\b|PortOfDischarge)', re.I)
+    END_CARGO = re.compile(r'^(PORT TOTAL|GRAND TOTAL|TOTAL\s*(PACK|GROSS\s*WEIGHT|MEASUREMENT)\b|PortOfDischarge)', re.I)
     ST_TOK = ('CY/CY', 'CY-CY', 'LCL/CFS', 'CFS/CFS', 'FCL/CFS', 'CY', 'LCL', 'CFS', 'FCL')
 
     # PORT OF DISCHARGE ต่อ 'หน้า' (พิมพ์ซ้ำในหัวตารางทุกหน้า อาจเปลี่ยนค่าได้ระหว่างไฟล์) — ใช้ตอน
@@ -548,7 +578,7 @@ def parse_manifest(path):
         if not BL_RE.match(bl):
             i += 1
             continue
-        rec = {'bl': bl, 'pkg_hdr': _cell(rows[i], 10), 'gw': _cell(rows[i], 16),
+        rec = {'bl': bl, 'pkg_hdr': _cell(rows[i], DESC_COL), 'gw': _cell(rows[i], WT_COL),
                'cons': '', 'notify': '', 'cont': [], 'status': '', 'meas': '',
                'marks': [], 'desc': [], 'transit': '', 'dg': '', 'reefer': '',
                'port_discharge': port_discharge_at[i],
@@ -568,7 +598,10 @@ def parse_manifest(path):
             # END ปกติอยู่คอลัมน์ 0 (เช่น 'PortOfDischarge: ...' ท้ายทุกหน้า) แต่ตัวสรุปยอดรวมทั้งฉบับ
             # ท้ายไฟล์จริง ('PORT TOTAL:' / 'TOTAL MEASUREMENT:' ฯลฯ) บางไฟล์พิมพ์เยื้องไปคอลัมน์ 1 แทน
             # — เช็คทุกคอลัมน์ในแถว ไม่งั้นบล็อก B/L สุดท้ายจะดูดข้อความสรุปยอดปนเข้า marks ไปเงียบๆ
-            if any(END.match(_cell(rows[j], k)) for k in range(len(rows[j]))):
+            # คอลัมน์ MARKS / DESCRIPTION (10) ใช้แบบเข้มกว่า (END_CARGO): ข้อความสินค้าจริงขึ้นต้นด้วย TOTAL ได้
+            # (เช่น marks 'TOTAL 4 CTNS ONLY') — ถ้านับเป็นท้ายบล็อก บรรทัดที่เหลือรวมเลขตู้ '1. HLHU...' จะหายเงียบๆ
+            if any((END_CARGO if k in (MARKS_COL, DESC_COL) else END).match(_cell(rows[j], k))
+                   for k in range(len(rows[j]))):
                 j += 1
                 break
             if a.startswith('C :'):
@@ -588,12 +621,12 @@ def parse_manifest(path):
                     rec['cont'].append(mm.group(1))
                 elif not re.match(r'^\d+\.\s*$', c5):
                     rec['marks'].append(c5)
-            for cc in (_cell(rows[j], MARKS_COL), _cell(rows[j], 10)):
+            for cc in (_cell(rows[j], MARKS_COL), _cell(rows[j], DESC_COL)):
                 if cc and DG_RE.search(cc) and not rec['dg']:
                     rec['dg'] = find_dg(cc)
                 if cc and re.search(r'REEFER|TEMP|อุณหภูมิ', cc, re.I) and not rec['reefer']:
                     rec['reefer'] = find_temp(cc)
-            c10 = _cell(rows[j], 10)
+            c10 = _cell(rows[j], DESC_COL)
             if c10:
                 u = c10.upper()
                 # DG/REEFER/TRANSIT ถูกดึงไปเก็บเป็นช่องแยกไว้แล้ว (ใช้ตรวจ/ไฮไลต์เฉพาะจุด) แต่ "ห้าม
@@ -620,12 +653,12 @@ def parse_manifest(path):
                     pass
                 else:
                     rec['desc'].append(c10)
-            c16 = _cell(rows[j], 16)
+            c16 = _cell(rows[j], WT_COL)
             if c16 and 'MTQ' in c16.upper() and not rec['meas']:
                 rec['meas'] = c16
             # 4 ช่องกฎเพิ่มเติม (col 15): "1) SHED NO. ####" / "2) ประเทศปลายทาง (XX)" /
             # "3) CARGO MOVEMENT (X)" / "4) TAX ID: (ชื่อ)" — พิมพ์เป็น 4 บรรทัดเรียงกันในบล็อกเดียวกัน
-            c15 = _cell(rows[j], 15)
+            c15 = _cell(rows[j], RULE_COL)
             if c15:
                 if c15.startswith('1)') and not rec['shed_no']:
                     msh = re.search(r'\d{3,4}', c15)
@@ -686,7 +719,7 @@ def parse_enter(path, bl_re):
         for b in pg.get_text('dict')['blocks']:
             for l in b.get('lines', []):
                 t = ''.join(s['text'] for s in l['spans']).strip()
-                mmv = re.match(r'^CARGO\s*MOVEMENT\s*([0-9A-Za-z\-]+)$', t, re.I)
+                mmv = re.match(r'^CARGO\s*MOVEMENT\s*[:=]?\s*([0-9A-Za-z][0-9A-Za-z\-]*)$', t, re.I)   # 'CARGO MOVEMENT 7' / ': 7' / '= 7'
                 if mmv:
                     y = l['bbox'][1]
                     # ต่างจาก FreeText annotation (ผูกกับ anchor "ด้านล่าง") — ข้อความ "CARGO MOVEMENT n"
@@ -783,6 +816,10 @@ def parse_enter(path, bl_re):
     if not (gt or blk or tot3 or tot4):
         tot4 = re.search(rf'\bTOTAL\s*({NUM})\s*PACKAGE\(?S?\)?\s*G\.?\s*W\.?\s*({NUM})\s*KGS\.?\s*({NUM})\s*M3',
                          full_text, re.I)
+    # Freight Links: 'Total Packages  : 433 PACKAGES' / 'Total Weight Kg : 24307.75 KG' / 'Total Volume m3 : 56.700 M3'
+    if not (gt or blk or tot3 or tot4):
+        tot4 = re.search(rf'Total\s+Packages\s*:\s*({NUM}).{{0,150}}?Total\s+Weight\s*Kg\s*:\s*({NUM})'
+                         rf'.{{0,150}}?Total\s+Volume\s*m3\s*:\s*({NUM})', full_text, re.I | re.S)
     if tot4:
         tot3 = tot4
     if gt:
@@ -1110,14 +1147,47 @@ def parse_enter(path, bl_re):
         rec['low_confidence'] = not layout_i_trusted
         ENT[bl] = rec
 
+    # เลย์เอาต์แบบที่ 10 ('AMENDMENT OF MANIFEST OF' ของ LX PANTOS): หน้าละ 1 B/L — ดู parse_enter_layout_j()
+    ENT_J = parse_enter_layout_j(doc, bl_re, ent_annot)
+    layout_j_trusted = _trusted(ENT_J[1], ENT_J[2])
+    for bl, rec in ENT_J[0].items():
+        rec['low_confidence'] = not layout_j_trusted
+        ENT[bl] = rec
+
+    # เลย์เอาต์แบบที่ 11 ('AMENDMENT' ฟอร์ม FM-CSI-01 ของ UNITEX/Planet): หัว B/L CHANGE NO. + HB/L NO
+    # แต่ CNTR NO./STATUS อยู่ในคอลัมน์ MARKS และเลข B/L แยก 2 บรรทัด ('HASLC0126092' + '9665A') — ดู parse_enter_layout_k()
+    ENT_K = parse_enter_layout_k(doc, bl_re, ent_annot)
+    _lk_junk = lambda k: any(k != b and b.startswith(k) for b in ENT_K[0])
+    for k in [k for k in ENT if _lk_junk(k)]:
+        del ENT[k]
+    layout_k_trusted = _trusted(ENT_K[1], ENT_K[2])
+    for bl, rec in ENT_K[0].items():
+        rec['low_confidence'] = not layout_k_trusted
+        ENT[bl] = rec
+
+    # เลย์เอาต์แบบที่ 12 (จดหมายแก้ MANIFEST ของ SINOTRANS): หน้าละ 1 B/L หัว 'MB/L NO. :' — ดู parse_enter_layout_l()
+    ENT_L = parse_enter_layout_l(doc, bl_re, ent_annot)
+    layout_l_trusted = _trusted(ENT_L[1], ENT_L[2])
+    for bl, rec in ENT_L[0].items():
+        rec['low_confidence'] = not layout_l_trusted
+        ENT[bl] = rec
+
+    # เลย์เอาต์แบบที่ 13 ('IMPORT CARGO MANIFEST' ของ FREIGHT LINKS EXPRESS): ดู parse_enter_layout_m()
+    ENT_M = parse_enter_layout_m(doc, bl_re, ent_annot)
+    layout_m_trusted = _trusted(ENT_M[1], ENT_M[2])
+    for bl, rec in ENT_M[0].items():
+        rec['low_confidence'] = not layout_m_trusted
+        ENT[bl] = rec
+
     # เติมด้วยตัวอ่านสำรองทั่วไปสำหรับ B/L ที่ layout A/B/C/D ที่รู้จักหาไม่เจอ (ทั้งเอกสาร ไม่ใช่แค่ตอน
     # ENT ว่างเปล่าทั้งหมด) — เอกสารผสมหลาย layout ต้องพึ่ง fallback เฉพาะหน้าที่ไม่ตรงทั้ง 4 แบบ
     for bl, rec in parse_enter_generic(doc, bl_re, ent_annot).items():
-        if bl not in ENT and not _li_junk(bl):
+        if bl not in ENT and not _li_junk(bl) and not _lk_junk(bl):
             ENT[bl] = rec
 
     for rec in ENT.values():
-        rec['movement_raw'] = ent_movement.get(rec['bl'], '') or rec.get('movement_raw', '')
+        if not rec.get('_mv_local'):   # ค่าที่อ่านจากบล็อกของ B/L เอง (layout F) แม่นกว่าการผูกตามตำแหน่ง
+            rec['movement_raw'] = ent_movement.get(rec['bl'], '') or rec.get('movement_raw', '')
     return ENT, declared
 
 
@@ -1233,6 +1303,15 @@ def parse_enter_layout_c(doc, bl_re, ent_annot):
 #   CBM คนละบรรทัด) ~727-765
 _LD_BL_X_MAX = 95
 _LD_MARKS_MAX, _LD_QTY_MAX, _LD_DESC_MAX, _LD_CONS_MAX = 300, 390, 545, 710
+# ฟอร์ม AMENDMENT ของ H.I.T. INTERCON (Handle Inter, [FM-CS-01-05]) หัวตารางเหมือน AGN แต่คอลัมน์ขยับซ้าย:
+#   MARKS ~166 | QUANTITY ~308 | DESCRIPTION ~383 | CONSIGNEE ~535 | GROSS WEIGHT ~704-749
+# ถ้าใช้ขอบของ AGN — DESCRIPTION ตกไปอยู่ QUANTITY และชื่อผู้รับตกไปอยู่ DESCRIPTION
+# ขอบวัดเมื่อหัว 'QUANTITY' อยู่ที่ x=312.6 — บางไฟล์ทั้งหน้าเลื่อนซ้าย ~6pt (หน้า Handle ใน hahm) จึงเลื่อนตามหัวนี้
+_LD_HANDLE_EDGES = (300, 375, 530, 700)
+_LD_HANDLE_QTY_X = 312.6
+# เช็คทีละหน้าจากรหัสฟอร์มท้ายหน้า (มีทุกหน้า; ชื่อบริษัทมีแค่หน้าแรก) — ENTER ชุดรวม (hahm) มีหน้า
+# Handle ปนกับหน้า AGN ในไฟล์เดียว จึงห้ามเหมาทั้งไฟล์
+_LD_HANDLE_RE = re.compile(r'\[FM-CS-01-05\]')
 _LD_HDR_RE = re.compile(r'^B\s*/\s*L\s*CHANGE\s*NO\.?$', re.I)
 _LD_QTY_RE = re.compile(r'^([\d,]+)\s+(.*)$')
 # ฟอนต์ไทยบางไฟล์ของ AGN ถอดข้อความออกมาเป็นอักขระแทน (เช่น '*** เร=งเป@ดตCDเขDาโกดIงด=วน ***' =
@@ -1330,6 +1409,11 @@ def parse_enter_layout_f(doc, bl_re, ent_annot):
         tot_y = min((y for y, x, t in items if re.match(r'^TOTAL\s+(?:QUANTITY|PKGS)\b', t, re.I)), default=1e9)
         cons_rows = [y for y, x, t in items if x < 60 and re.match(r'^CONSIGNEE(?:\s*\[\d+\])?\s*:?$', t, re.I)]
         cntr_rows = [y for y, x, t in items if x < 60 and re.match(r'^C(?:NTR|TRN)\s*NO\s*:?$', t, re.I)]
+        # แถว CONSIGNEE จริงของบล็อกต้องมีแถว CNTR NO ของตัวเองตามมาก่อนเจอ CONSIGNEE แถวถัดไป — 'CONSIGNEE:'
+        # ที่เป็นส่วนหนึ่งของ MARKS (Eastern Air: 'SHIPPER : ESA' / 'CONSIGNEE:' / 'J & U COMPANY LIMITED' ใน marks)
+        # ไม่ใช่หัวบล็อก ถ้านับเป็นหัวบล็อก เนื้อหาทั้งบล็อกจะถูกกินหายไปทั้ง B/L
+        cons_rows = [cy for i, cy in enumerate(cons_rows)
+                     if any(cy < y < (cons_rows[i + 1] if i + 1 < len(cons_rows) else 1e9) for y in cntr_rows)]
         start = -1e9
         last_end = max(cntr_rows, default=-1e9)
         if tot_y == 1e9:
@@ -1370,6 +1454,9 @@ def parse_enter_layout_f(doc, bl_re, ent_annot):
             pkgtype = mq.group(2).strip() if mq else ''
             rec = ent_annot.get(bl, {})
             combined = f'{marks} {desc}'.strip()
+            # 'CARGO MOVEMENT: L' / 'CARGO MOVEMENT: 7' พิมพ์อยู่ในบล็อกสินค้าของ B/L เอง (เหนือแถว D/O No.) —
+            # ตัวสแกนรวมใน parse_enter() ผูกกับ B/L "ด้านบน" ซึ่งผิดสำหรับฟอร์มนี้ และไม่รับเครื่องหมาย ':'
+            mvm = re.search(r'CARGO\s*MOVEMENT\s*:?\s*([0-9A-Za-z][0-9A-Za-z\-]*)', combined, re.I)
             ENT[bl] = {
                 'bl': bl, 'cons': cons.strip(), 'cont': cont, 'pkgs': pkgs, 'pkgtype': pkgtype,
                 'gw': gw, 'meas': meas, 'marks': marks.strip(), 'desc': desc.strip(),
@@ -1377,6 +1464,7 @@ def parse_enter_layout_f(doc, bl_re, ent_annot):
                 'transit_raw': rec.get('transit', '') or (combined if TRANSIT_RE.search(combined) else ''),
                 'dg': rec.get('dg', '') or find_dg(combined),
                 'reefer': rec.get('reefer', '') or find_temp(combined),
+                'movement_raw': mvm.group(1).upper() if mvm else '', '_mv_local': bool(mvm),
             }
     # annotation 'ทุกBL' ที่ถูกผูกกับ B/L ใกล้สุดตัวเดียว — ตัดคำกำกับขอบเขตออกให้เหลือแต่คำสั่ง STATUS
     if global_status:
@@ -1450,6 +1538,239 @@ def parse_enter_layout_g(doc, bl_re, ent_annot):
             'dg': rec.get('dg', '') or find_dg(combined),
             'reefer': rec.get('reefer', '') or find_temp(combined),
         }
+    return ENT, len(ENT), n_anchor
+
+
+# ═══════════ 2j) ENTER.pdf — เลย์เอาต์แบบที่ 10: 'AMENDMENT OF MANIFEST OF' ของ LX PANTOS ═══════════
+# หน้าละ 1 B/L (ลูกค้ามักส่งไฟล์ละ 1 หน้า — รวมเป็น PDF เดียวก่อนรัน). ต่อหน้า:
+#   'B/L NO.' (x~40) ': HASLK02260000123' (x~88, ขึ้นต้นด้วย ': ')
+#   หัว 'MARK' (x~40) / 'NO PACKAGES' (x~200) / 'DESCRIPTION OF GOODS' (x~340)
+#   แถวสินค้า: marks x<195 | '10 PACKAGES' 195–335 | desc ≥335
+#   แถว '(W:' : G.W. '8,086.000' อยู่ระหว่าง '(W:' กับ 'KGS./M :' และ MEAS '8.000' อยู่ก่อน 'CBM.)'
+#   'TOTAL' / 'CONSIGNEE' / 'NOTIFY PARTY' / 'SHIPPER' / 'CONTAINER NO' / 'STATUS' : ค่าอยู่ x≥130
+# STATUS เช่น '***CY ลากตู้*** D/O รับแหลมฉบัง'. NOTIFY 'SAME AS ABOVE' = ผู้รับรายเดียวกัน.
+_LJ_MARKS_MAX, _LJ_PKG_MAX = 195, 335
+
+
+def parse_enter_layout_j(doc, bl_re, ent_annot):
+    """คืน (records:dict[bl->rec], n_success, n_anchor)."""
+    full_text_upper = '\n'.join(doc[p].get_text() for p in range(doc.page_count)).upper()
+    if 'LX PANTOS' not in full_text_upper or 'AMENDMENT OF MANIFEST OF' not in full_text_upper:
+        return {}, 0, 0
+    ENT, n_anchor = {}, 0
+    for p in range(doc.page_count):
+        items = sorted((y, x, t) for y, x, t in _page_lines(doc[p]))
+        lbl = next(((y, x) for y, x, t in items if x < 80 and re.match(r'^B/L\s*NO\.?$', t, re.I)), None)
+        hdr_y = next((y for y, x, t in items if x < 80 and t.upper() == 'MARK'), None)
+        w_row = next(((y, x) for y, x, t in items if t.upper().startswith('(W:')), None)
+        if not lbl or hdr_y is None or not w_row:
+            continue
+        n_anchor += 1
+        bl = next((re.sub(r'^:\s*', '', t).split()[0] for y, x, t in items
+                   if abs(y - lbl[0]) < 3 and x > lbl[1] + 20 and re.sub(r'^:\s*', '', t)), '')
+        if not bl_re.match(bl):
+            continue
+
+        def val(label):
+            ly = next((y for y, x, t in items if x < 80 and re.match(rf'^{label}\s*:?$', t, re.I)), None)
+            if ly is None:
+                return ''
+            return ' '.join(t for y, x, t in items if abs(y - ly) < 4 and x >= 130 and t != ':')
+
+        body = [(y, x, t) for y, x, t in items if hdr_y + 5 < y < w_row[0] - 3]
+        marks = ' '.join(t.strip() for y, x, t in body if x < _LJ_MARKS_MAX)
+        qty_line = next((t.strip() for y, x, t in body if _LJ_MARKS_MAX <= x < _LJ_PKG_MAX), '')
+        desc = ' '.join(t.strip() for y, x, t in body if x >= _LJ_PKG_MAX)
+        wrow = sorted((x, t) for y, x, t in items if abs(y - w_row[0]) < 4)
+        kgs_x = next((x for x, t in wrow if t.strip().upper().startswith('KGS')), 1e9)
+        cbm_x = next((x for x, t in wrow if t.strip().upper().startswith('CBM')), 1e9)
+        gw = next((num(t) for x, t in wrow if w_row[1] < x < kgs_x and re.match(r'^[\d,.]+$', t.strip())), None)
+        meas = next((num(t) for x, t in wrow if kgs_x < x < cbm_x and re.match(r'^[\d,.]+$', t.strip())), None)
+        mq = re.match(r'^([\d,]+)\s+(.*)$', qty_line)
+        pkgs = int(mq.group(1).replace(',', '')) if mq else None
+        pkgtype = mq.group(2).strip() if mq else ''
+        cons = val('CONSIGNEE').strip()
+        notify = val('NOTIFY PARTY').strip()
+        if re.match(r'^SAME\s+AS\s+(ABOVE|CONSIGNEE)', notify, re.I):
+            notify = cons
+        cm = CONT_RE.search(val('CONTAINER NO'))
+        cont = cm.group(0) if cm else ''
+        status = re.sub(r'\s+', ' ', val('STATUS')).strip()
+        rec = ent_annot.get(bl, {})
+        combined = f'{marks} {desc}'.strip()
+        ENT[bl] = {
+            'bl': bl, 'cons': cons, 'cont': cont, 'pkgs': pkgs, 'pkgtype': pkgtype,
+            'gw': gw, 'meas': meas, 'marks': marks, 'desc': desc,
+            **({'notify': notify} if notify else {}),
+            'status_raw': rec.get('status', '') or status,
+            'transit_raw': rec.get('transit', '') or (combined if TRANSIT_RE.search(combined) else ''),
+            'dg': rec.get('dg', '') or find_dg(combined),
+            'reefer': rec.get('reefer', '') or find_temp(combined),
+        }
+    return ENT, len(ENT), n_anchor
+
+
+# ═══════════ 2l) ENTER.pdf — เลย์เอาต์แบบที่ 12: จดหมายแก้ MANIFEST ของ SINOTRANS ═══════════
+# หน้าละ 1 B/L (มีหน้าว่างคั่น). ต่อหน้า:
+#   'MB/L NO. :    HASLC01260000123A' (x~22) / 'CNEE :  <ชื่อ>' (x~29) / 'ISSUED D/O AS FOLLOWING:'
+#   หัว 'MARKS & NOS.' (x~24) / 'QUANTITY' (x~169) / 'DESCRIPTION OF GOODS' (x~275)
+#   แถวสินค้า: marks x<165 | '6  PALLETS' 165–265 | desc ≥265 — ลงไปถึงแถว 'CONTR NO.'
+#   'SKHU1112223 / 40' HQ' (x~101 แถว CONTR NO.) / 'G.W.     :     670.00     KGS' (x~326)
+#   'CBM      :' (x~327) แล้วค่า '6.00    CBM' (x~381) / 'STATUS      :' + 'CY/CY' (x~101)
+# เลข B/L บางหน้าพิมพ์ตัวนำซ้ำ ('HHASLC...') — ตัดตัวอักษรนำทิ้งจนแมตช์ bl_re.
+_LL_MARKS_MAX, _LL_PKG_MAX = 165, 265
+
+
+def parse_enter_layout_l(doc, bl_re, ent_annot):
+    """คืน (records:dict[bl->rec], n_success, n_anchor)."""
+    full_text_upper = '\n'.join(doc[p].get_text() for p in range(doc.page_count)).upper()
+    if 'MB/L NO' not in full_text_upper or 'ISSUED D/O AS FOLLOWING' not in full_text_upper \
+            or 'CONTR NO' not in full_text_upper:
+        return {}, 0, 0
+    ENT, n_anchor = {}, 0
+    for p in range(doc.page_count):
+        items = sorted((y, x, t.strip()) for y, x, t in _page_lines(doc[p]))
+        # บางหน้า 'V.2609S' ของ FEEDER VESSEL ตกมาอยู่หน้าป้าย ('V.2609S MB/L NO. :  HASLC...') — หาป้ายกลางบรรทัด
+        blm = next((re.search(r'\bMB/L\s*NO\.?\s*:?\s*(\S+)', t, re.I) for y, x, t in items
+                    if re.search(r'\bMB/L\s*NO', t, re.I)), None)
+        hdr_y = next((y for y, x, t in items if re.match(r'^MARKS\s*&\s*NOS', t, re.I)), None)
+        ct = next(((y, x) for y, x, t in items if re.match(r'^CONTR\s*NO', t, re.I)), None)
+        if not blm or hdr_y is None or not ct:
+            continue
+        n_anchor += 1
+        bl = blm.group(1).upper()
+        while bl and not bl_re.match(bl) and len(bl) > 10:
+            bl = bl[1:]
+        if not bl_re.match(bl):
+            continue
+        cons = next((re.sub(r'^CNEE\s*:\s*', '', t, flags=re.I) for y, x, t in items
+                     if re.match(r'^CNEE\s*:', t, re.I)), '')
+        body = [(y, x, t) for y, x, t in items if hdr_y + 5 < y < ct[0] - 8]
+        marks = ' '.join(t for y, x, t in body if x < _LL_MARKS_MAX)
+        qty_line = ' '.join(t for y, x, t in body if _LL_MARKS_MAX <= x < _LL_PKG_MAX)
+        desc = ' '.join(t for y, x, t in body if x >= _LL_PKG_MAX)
+        cm = next((CONT_RE.search(t) for y, x, t in items if abs(y - ct[0]) < 6 and x > ct[1] + 50
+                   and CONT_RE.search(t)), None)
+        cont = cm.group(0) if cm else ''
+        gw = next((num(re.sub(r'^G\.W\.\s*:', '', t)) for y, x, t in items if re.match(r'^G\.W\.', t)), None)
+        meas = next((num(t) for y, x, t in items if re.match(r'^[\d,.]+\s*CBM', t, re.I)), None)
+        st = next(((y, x) for y, x, t in items if re.match(r'^STATUS\s*:?$', t, re.I)), None)
+        status = ' '.join(t for y, x, t in items if st and abs(y - st[0]) < 4 and st[1] + 50 < x < 300)
+        mq = re.match(r'^([\d,]+)\s+(.*)$', qty_line)
+        pkgs = int(mq.group(1).replace(',', '')) if mq else None
+        pkgtype = re.sub(r'\s+', ' ', mq.group(2)).strip() if mq else ''
+        rec = ent_annot.get(bl, {})
+        combined = f'{marks} {desc}'.strip()
+        ENT[bl] = {
+            'bl': bl, 'cons': cons.strip(), 'cont': cont, 'pkgs': pkgs, 'pkgtype': pkgtype,
+            'gw': gw, 'meas': meas, 'marks': marks, 'desc': desc,
+            'status_raw': rec.get('status', '') or re.sub(r'\s+', ' ', status).strip(),
+            'transit_raw': rec.get('transit', '') or (combined if TRANSIT_RE.search(combined) else ''),
+            'dg': rec.get('dg', '') or find_dg(combined),
+            'reefer': rec.get('reefer', '') or find_temp(combined),
+        }
+    return ENT, len(ENT), n_anchor
+
+
+# ═══════════ 2m) ENTER.pdf — เลย์เอาต์แบบที่ 13: 'IMPORT CARGO MANIFEST' ของ FREIGHT LINKS EXPRESS ═══════════
+# หน้า 1 = จดหมายปะหน้า ('OBL NO : <master B/L>') มีช่องติ๊ก [ X ] CY / UNSTUFFING INTO GODOWN / … และ
+# FreeText STATUS ('**เร่งเปิดตู้เข้าโกดัง', 'จ่ายเงินกทม. Do รับแหลม') ที่ใช้กับทุก B/L — หน้านี้ไม่มี anchor
+# เลข B/L ตัวสแกน annotation ทั่วไปจึงข้ามทิ้ง ต้องอ่านเองที่นี่.
+# หน้าถัดไป: หัว 'Container No' : 'SKHU3334445 - 40 FT' (x~99, ใช้ทั้งหน้า), หัวตาราง 'MARKINGS & NOS' (x~37) /
+# 'NO OF PACKAGES' (x~230) / 'DESCRIPTION OF GOODS' (x~388). ต่อบล็อก: แถวสินค้า แล้ว
+#   'CUSTOMS B/L NO <B/L>' / 'CONSIGNEE :' + ชื่อ (x~125) / 'GROSS WEIGHT : 103.00 KG' + 'MEASUREMENT :' + '0.940 M3'
+#   แล้วเส้น '_____' ปิดบล็อก. ยอดรวม 'Total Packages : n PACKAGES' / 'Total Weight Kg' / 'Total Volume m3'.
+# '2 BAGS (1 PALLET)' — วงเล็บหลังหน่วยถูกยกไปต้น desc ให้ตรงกับที่ MANIFEST เขียน ('(1 PALLET) THERMOPLASTIC…').
+def parse_enter_layout_m(doc, bl_re, ent_annot):
+    """คืน (records:dict[bl->rec], n_success, n_anchor)."""
+    full_text_upper = '\n'.join(doc[p].get_text() for p in range(doc.page_count)).upper()
+    if 'IMPORT CARGO MANIFEST' not in full_text_upper or 'CUSTOMS B/L NO' not in full_text_upper \
+            or 'MARKINGS & NOS' not in full_text_upper:
+        return {}, 0, 0
+    # STATUS ทั้งฉบับจากจดหมายปะหน้า: ช่องที่ติ๊ก X + FreeText ทุกอันที่ยาวกว่า 1 ตัวอักษร
+    doc_status = []
+    for p in range(doc.page_count):
+        pg = doc[p]
+        items = _page_lines(pg)
+        if not any(re.match(r'^OBL\s*NO', t, re.I) for y, x, t in items):
+            continue
+        marks_x = [(y, x) for y, x, t in items if t.strip().upper() == 'X']
+        for y, x, t in items:
+            if x > 110 and any(abs(y - my) < 5 and 57 < mx < 110 for my, mx in marks_x) \
+                    and re.match(r'^[A-Z][A-Z ]+$', t.strip()):
+                doc_status.append(t.strip())
+        for a in (pg.annots() or []):
+            if a.type[1] == 'FreeText':
+                txt = re.sub(r'\s+', ' ', a.info.get('content', '')).strip()
+                if len(txt) > 1:
+                    doc_status.append(txt)
+    doc_status = ' '.join(doc_status)
+    ENT, n_anchor = {}, 0
+    for p in range(doc.page_count):
+        items = sorted((y, x, t.strip()) for y, x, t in _page_lines(doc[p]))
+        hdr_y = next((y for y, x, t in items if re.match(r'^MARKINGS\s*&\s*NOS', t, re.I)), None)
+        if hdr_y is None:
+            continue
+        pkg_x = next((x for y, x, t in items if abs(y - hdr_y) < 3 and t.upper().startswith('NO OF PACK')), 225)
+        desc_x = next((x for y, x, t in items if abs(y - hdr_y) < 3 and t.upper().startswith('DESCRIPTION')), 380)
+        cy = next((y for y, x, t in items if re.match(r'^Container\s*No$', t, re.I)), None)
+        cm = next((CONT_RE.search(t) for y, x, t in items if cy is not None and abs(y - cy) < 3
+                   and CONT_RE.search(t)), None)
+        cont = cm.group(0) if cm else ''
+        start = hdr_y + 3
+        anchors = [r for r in items if re.match(r'^CUSTOMS\s+B/L\s+NO\b', r[2], re.I)]
+        # FreeText บนหน้าตาราง: แถว 'CUSTOMS B/L NO' ไม่ขึ้นต้นด้วยเลข B/L ตัวสแกนทั่วไปจึงไม่เห็น — ผูกกับ
+        # แถว B/L แรกที่อยู่ใต้ annotation (เลข B/L พิมพ์ท้ายบล็อกสินค้าของตัวเอง)
+        page_annot = {}
+        for a in (doc[p].annots() or []):
+            txt = re.sub(r'\s+', ' ', a.info.get('content', '')).strip() if a.type[1] == 'FreeText' else ''
+            if len(txt) <= 1 or not anchors:
+                continue
+            ay = a.rect.y0
+            by_ = min((r for r in anchors if r[0] > ay - 5), default=anchors[-1])
+            k = re.sub(r'^CUSTOMS\s+B/L\s+NO\s*:?\s*', '', by_[2], flags=re.I).split()
+            r_ = page_annot.setdefault(k[0].upper() if k else '', {})
+            if DG_RE.search(txt):
+                r_['dg'] = find_dg(txt)
+            elif re.search(r'REEFER|TEMP|อุณหภูมิ', txt, re.I):
+                r_['reefer'] = find_temp(txt)
+            elif TRANSIT_RE.search(txt):
+                r_['transit'] = txt
+            else:
+                r_['status'] = (r_.get('status', '') + ' ' + txt).strip()
+        for by, bx, bt in anchors:
+            n_anchor += 1
+            bl = re.sub(r'^CUSTOMS\s+B/L\s+NO\s*:?\s*', '', bt, flags=re.I).split()
+            bl = bl[0].upper() if bl else ''
+            body = [(y, x, t) for y, x, t in items if start < y < by - 2 and not re.match(r'^_{5,}$', t)]
+            sep_y = min((y for y, x, t in items if y > by and re.match(r'^_{5,}$', t)), default=by + 40)
+            start = sep_y + 2
+            if not bl_re.match(bl):
+                continue
+            tail = [(y, x, t) for y, x, t in items if by + 2 < y < sep_y - 2]
+            cons = ' '.join(t for y, x, t in tail if x >= 100 and x < 260
+                            and any(abs(y - yy) < 3 and re.match(r'^CONSIGNEE\s*:?$', tt, re.I) for yy, xx, tt in tail))
+            gw = next((num(re.sub(r'^GROSS\s+WEIGHT\s*:', '', t, flags=re.I)) for y, x, t in tail
+                       if re.match(r'^GROSS\s+WEIGHT', t, re.I)), None)
+            meas = next((num(t) for y, x, t in tail if re.match(r'^[\d,.]+\s*M3$', t, re.I)), None)
+            marks = ' '.join(t for y, x, t in body if x < pkg_x - 5)
+            qty_line = ' '.join(t for y, x, t in body if pkg_x - 5 <= x < desc_x - 5)
+            desc = ' '.join(t for y, x, t in body if x >= desc_x - 5)
+            mq = re.match(r'^([\d,]+)\s*([A-Za-z]+)\s*(.*)$', qty_line)
+            pkgs = int(mq.group(1).replace(',', '')) if mq else None
+            pkgtype = mq.group(2) if mq else ''
+            if mq and mq.group(3):
+                desc = f'{mq.group(3)} {desc}'.strip()
+            rec = {**ent_annot.get(bl, {}), **page_annot.get(bl, {})}
+            combined = f'{marks} {desc}'.strip()
+            ENT[bl] = {
+                'bl': bl, 'cons': cons.strip(), 'cont': cont, 'pkgs': pkgs, 'pkgtype': pkgtype,
+                'gw': gw, 'meas': meas, 'marks': marks, 'desc': desc,
+                'status_raw': rec.get('status', '') or doc_status,
+                'transit_raw': rec.get('transit', '') or (combined if TRANSIT_RE.search(combined) else ''),
+                'dg': rec.get('dg', '') or find_dg(combined),
+                'reefer': rec.get('reefer', '') or find_temp(combined),
+            }
     return ENT, len(ENT), n_anchor
 
 
@@ -1545,10 +1866,19 @@ def parse_enter_layout_d(doc, bl_re, ent_annot):
                 # ฟอนต์บางไฟล์เพี้ยนอีกแบบ ('เรรงเปปดตตเขตาโกดดงดรวน') — จับจากโครงพยัญชนะแทน
                 if re.search(r'เร.งเป.ดต.{1,2}เข.าโกด.งด.วน', head_status):
                     head_status = 'เร่งเปิดตู้เข้าโกดังด่วน'
+                # '*** ลากตู้ ***' ถอดออกมาเป็น 'ลากตต' / 'ลากตตต' (Handle Inter)
+                elif re.fullmatch(r'ลาก\s*ต{1,3}', head_status):
+                    head_status = 'ลากตู้'
             break
 
     ENT, n_anchor = {}, 0
     for items in pages:
+        handle = any(_LD_HANDLE_RE.search(t) for _, _, t in items)
+        if handle:
+            qx = next((x for y, x, t in items if re.fullmatch(r'QUANTITY', t, re.I)), _LD_HANDLE_QTY_X)
+            MARKS_MAX, QTY_MAX, DESC_MAX, CONS_MAX = (e + qx - _LD_HANDLE_QTY_X for e in _LD_HANDLE_EDGES)
+        else:
+            MARKS_MAX, QTY_MAX, DESC_MAX, CONS_MAX = _LD_MARKS_MAX, _LD_QTY_MAX, _LD_DESC_MAX, _LD_CONS_MAX
         items = sorted(i for i in items if not _PAGELN.match(i[2]))   # ตัดบรรทัด 'Page n of m' ท้ายหน้า
         anchors = []
         for y, x, t in items:
@@ -1566,26 +1896,27 @@ def parse_enter_layout_d(doc, bl_re, ent_annot):
             n_anchor += 1
             y_end = anchors[idx + 1][0] if idx + 1 < len(anchors) else 1e9
             if tot_y is not None and ay < tot_y < y_end:
-                y_end = tot_y
+                # Handle Inter: ยอดรวม '12,437.740 KGS.' อยู่สูงกว่าบรรทัด TOTAL ~4pt — ตัดก่อนถึง 6pt
+                y_end = tot_y - 6 if handle else tot_y
             band = [(y, x, t) for y, x, t in items if ay - 2 <= y < y_end]
 
-            marks = ' '.join(t for y, x, t in band if _LD_BL_X_MAX <= x < _LD_MARKS_MAX)
+            marks = ' '.join(t for y, x, t in band if _LD_BL_X_MAX <= x < MARKS_MAX)
             # QUANTITY อาจถูกตัดเป็น 2 บรรทัด ('203' / 'CARTONS') — ต่อทุกบรรทัดในคอลัมน์ก่อนแยกจำนวน/ชนิด
-            qty_line = ' '.join(t for y, x, t in band if _LD_MARKS_MAX <= x < _LD_QTY_MAX)
+            qty_line = ' '.join(t for y, x, t in band if MARKS_MAX <= x < QTY_MAX)
             # 'CARGO MOVEMENT n' ตัดออกจาก DESCRIPTION — เป็นรหัสศุลกากรล้วนๆ ไม่ใช่ "รายละเอียดสินค้า"
             # และมีคอลัมน์ CARGO MOVEMENT ของตัวเองอยู่แล้ว (ดึงแยกไว้ที่ ent_movement ข้างบน) เข้าเกณฑ์
             # เดียวกับที่ตัด STATUS/รหัสชนิดตู้ออกจาก DESCRIPTION (MANIFEST) ฝั่งเดียวกัน
-            desc = ' '.join(t for y, x, t in band if _LD_QTY_MAX <= x < _LD_DESC_MAX
-                             and not re.match(r'^CARGO\s*MOVEMENT\s*[0-9A-Za-z\-]+$', t, re.I))
+            desc = ' '.join(t for y, x, t in band if QTY_MAX <= x < DESC_MAX
+                             and not re.match(r'^CARGO\s*MOVEMENT\s*[:=]?\s*[0-9A-Za-z][0-9A-Za-z\-]*$', t, re.I))
             cont_line = next((t for y, x, t in band if x < _LD_BL_X_MAX and re.search(r'Cont\s*No', t, re.I)), '')
 
             # CONSIGNEE และ 'NOTIFY:' ซ้อนอยู่คอลัมน์เดียวกัน — ตัดที่บรรทัด 'NOTIFY:' เอง
-            cons_col = sorted((y, t) for y, x, t in band if _LD_DESC_MAX <= x < _LD_CONS_MAX)
+            cons_col = sorted((y, t) for y, x, t in band if DESC_MAX <= x < CONS_MAX)
             ni = next((i for i, (y, t) in enumerate(cons_col) if re.match(r'^NOTIFY\s*:?$', t, re.I)), None)
             cons = ' '.join(t for _, t in (cons_col[:ni] if ni is not None else cons_col))
             notify = ' '.join(t for _, t in cons_col[ni + 1:]) if ni is not None else ''
 
-            gw_lines = [t for y, x, t in band if x >= _LD_CONS_MAX]
+            gw_lines = [t for y, x, t in band if x >= CONS_MAX]
             gw = next((num(t) for t in gw_lines if 'KGS' in t.upper()), None)
             meas = next((num(t) for t in gw_lines if 'CBM' in t.upper() or 'M3' in t.upper()), None)
 
@@ -1647,8 +1978,10 @@ def parse_enter_layout_i(doc, bl_re, ent_annot):
         for idx, (ay, bl) in enumerate(anchors):
             n_anchor += 1
             y_end = anchors[idx + 1][0] if idx + 1 < len(anchors) else 1e9
+            # 'G.W … KGS.' ของแถว TOTAL อยู่สูงกว่าคำ 'TOTAL' ~3pt — ตัดบล็อกสุดท้ายก่อนถึง TOTAL 8pt
+            # ไม่งั้นยอดรวมทั้งฉบับไหลเข้าช่อง CONSIGNEE ของ B/L สุดท้าย (SAWASDEE SPICA 2610S, 2026-11-02)
             if tot_y is not None and ay < tot_y < y_end:
-                y_end = tot_y
+                y_end = tot_y - 8
             band = [(y, x, t) for y, x, t in items if ay - 2 <= y < y_end]
             col = lambda lo, hi: [t for y, x, t in band if lo <= x < hi]
             marks = ' '.join(col(_LI_BL_X_MAX, _LI_MARKS_MAX))
@@ -1664,14 +1997,82 @@ def parse_enter_layout_i(doc, bl_re, ent_annot):
             if si is not None:
                 status = re.sub(r'^STATUS\s*=?\s*', '', hbl[si], flags=re.I).strip() or ' '.join(hbl[si + 1:])
                 status = status.replace('ҟ', '้').replace(' ', '') if re.search('[฀-๿]', status) else status
-            # เลขตู้อยู่ระหว่างเลข HB/L กับ STATUS — ต่อบรรทัดก่อน (เลขตู้ถูกตัดกลาง) แล้วค่อยแยกด้วย ','
-            cont_txt = ''.join(t for t in hbl[:si] if not re.search(r'UW$|^[A-Z]$', t) or CONT_RE.fullmatch(t))
+            # เลขตู้อยู่ระหว่างเลข HB/L กับ STATUS — เริ่มที่บรรทัดแรกที่ขึ้นต้นเป็นเลขตู้ (เลข HB/L ลงท้ายได้หลายแบบ
+            # เช่น '...UW'+'S' หรือ '...-AU'+'WS') ต่อบรรทัดก่อน (เลขตู้ถูกตัดกลาง) แล้วค่อยแยกด้วย ','
+            pre = hbl[:si] if si is not None else hbl
+            ci = next((i for i, t in enumerate(pre) if re.match(r'^[A-Z]{4}\d', t)), len(pre))
+            cont_txt = ''.join(pre[ci:])
             conts = [c for c in cont_txt.split(',') if CONT_RE.fullmatch(c.strip())]
             mq = _LD_QTY_RE.match(qty_line)
             rec = ent_annot.get(bl, {})
             combined = f'{marks} {desc}'.strip()
             ENT[bl] = {
                 'bl': bl, 'cons': cons.strip(), 'cont': ', '.join(c.strip() for c in conts),
+                'pkgs': int(mq.group(1).replace(',', '')) if mq else None,
+                'pkgtype': mq.group(2).strip() if mq else '',
+                'gw': gw, 'meas': meas, 'marks': marks.strip(), 'desc': desc.strip(),
+                'status_raw': rec.get('status', '') or status,
+                'transit_raw': rec.get('transit', '') or (desc if TRANSIT_RE.search(desc) else ''),
+                'dg': rec.get('dg', '') or find_dg(combined),
+                'reefer': rec.get('reefer', '') or find_temp(combined),
+            }
+    return ENT, len(ENT), n_anchor
+
+
+# ═══════════════ 2k) ENTER.pdf — เลย์เอาต์แบบที่ 11: 'AMENDMENT' FM-CSI-01 (UNITEX / Planet) ═══════════════
+# หัวตาราง: B/L CHANGE NO. ~31 | MARKS & NUMBERS ~118 | QUANTITY ~263 | DESCRIPTION ~349 | CONSIGNEE ~490 |
+#           GROSS WEIGHT ~606-636 (KGS. แล้ว M3 บรรทัดล่าง) | HB/L NO ~694
+# คอลัมน์ MARKS = เครื่องหมาย แล้ว 'CNTR NO.:' / "SKLU5556667/20'GP" / 'STATUS: CY' ต่อท้าย (ไม่ใช่ marks)
+_LK_BL_X_MAX, _LK_MARKS_MAX, _LK_QTY_MAX, _LK_DESC_MAX, _LK_CONS_MAX, _LK_GW_MAX = 100, 255, 340, 485, 600, 688
+
+
+def parse_enter_layout_k(doc, bl_re, ent_annot):
+    pages = [_page_lines(doc[p]) for p in range(doc.page_count)]
+    pages = [it for it in pages if any(_LD_HDR_RE.match(t) and x < _LK_BL_X_MAX for _, x, t in it)
+             and any(re.fullmatch(r'HB\s*/\s*L\s*NO\.?', t, re.I) and x > 650 for _, x, t in it)
+             and any(re.match(r'^CNTR\s*NO\.?\s*:', t, re.I) and _LK_BL_X_MAX <= x < _LK_MARKS_MAX for _, x, t in it)]
+    ENT, n_anchor = {}, 0
+    for items in pages:
+        items = sorted(i for i in items if not _PAGELN.match(i[2]))
+        hdr_y = max((y for y, x, t in items if _LD_HDR_RE.match(t)), default=0)
+        anchors = []
+        for y, x, t in items:
+            if y > hdr_y and x < _LK_BL_X_MAX and re.fullmatch(r'[A-Z]{4,5}\d{6,}', t):
+                tail = next((t2 for y2, x2, t2 in items if 0 < y2 - y < 16 and abs(x2 - x) < 4
+                             and re.fullmatch(r'[A-Z0-9]{1,6}', t2)), '')
+                if bl_re.match(t + tail):
+                    anchors.append((y, t + tail))
+        anchors.sort()
+        # บรรทัดยอดรวมท้ายเอกสาร ('TOTAL' / '952 PACKAGE(S)' / 'G.W 37,142.000 KGS.' ซึ่งลอยสูงกว่า TOTAL ~3pt)
+        tot_y = min((y for y, x, t in items if re.fullmatch(r'TOTAL', t.strip(), re.I)), default=None)
+        for idx, (ay, bl) in enumerate(anchors):
+            n_anchor += 1
+            y_end = anchors[idx + 1][0] if idx + 1 < len(anchors) else 1e9
+            if tot_y is not None and ay < tot_y < y_end:
+                y_end = tot_y - 6
+            band = [(y, x, t.strip()) for y, x, t in items if ay - 2 <= y < y_end and t.strip()]
+            col = lambda lo, hi: [t for y, x, t in band if lo <= x < hi]
+            mcol = col(_LK_BL_X_MAX, _LK_MARKS_MAX)
+            ci = next((i for i, t in enumerate(mcol) if re.match(r'^CNTR\s*NO', t, re.I)), len(mcol))
+            marks = ' '.join(mcol[:ci])
+            conts, status = [], ''
+            for t in mcol[ci:]:
+                ms = re.match(r'^STATUS\s*:?\s*(.*)$', t, re.I)
+                if ms:
+                    status = ms.group(1).strip()
+                else:
+                    conts += CONT_RE.findall(t)
+            qty_line = ' '.join(col(_LK_MARKS_MAX, _LK_QTY_MAX))
+            desc = ' '.join(col(_LK_QTY_MAX, _LK_DESC_MAX))
+            cons = ' '.join(col(_LK_DESC_MAX, _LK_CONS_MAX))
+            gw_lines = col(_LK_CONS_MAX, _LK_GW_MAX)
+            gw = next((num(t) for t in gw_lines if 'KGS' in t.upper()), None)
+            meas = next((num(t) for t in gw_lines if re.search(r'CBM|M3', t, re.I)), None)
+            mq = _LD_QTY_RE.match(qty_line)
+            rec = ent_annot.get(bl, {})
+            combined = f'{marks} {desc}'.strip()
+            ENT[bl] = {
+                'bl': bl, 'cons': cons.strip(), 'cont': ', '.join(conts),
                 'pkgs': int(mq.group(1).replace(',', '')) if mq else None,
                 'pkgtype': mq.group(2).strip() if mq else '',
                 'gw': gw, 'meas': meas, 'marks': marks.strip(), 'desc': desc.strip(),
@@ -2282,7 +2683,14 @@ def build_report(MAN, ENT, vessel, man_declared, ent_declared, outpath):
             for k in ('pkg', 'gw', 'meas') if k in man_declared))
     decl_txt = ('ยอดที่ระบุในเอกสาร — ' + '  |  '.join(decl_bits) + '  ||  ') if decl_bits else ''
 
-    trow = [(f'{OK} ยอดรวม ENTER = MANIFEST' if _all_ok else f'{WARN} ยอดรวมไม่ตรง — ตรวจด่วน'),
+    # ยอดรวมตรงกันแต่มีจุดอื่นต้องตรวจ (TRANSIT/DG/...) — อย่าเขียนว่า "ยอดรวมไม่ตรง" ให้เข้าใจผิด บอกให้ชัดว่าเป็นเรื่องอะไร
+    _flags = [f'{lbl} {TOT[k]} B/L' for k, lbl in (('st_bad', 'STATUS ไม่ตรง'), ('transit', 'TRANSIT'), ('dg', 'DG'),
+              ('reefer', 'REEFER'), ('shed_bad', 'SHED ไม่ตรง'), ('dest_bad', 'ปลายทางไม่ตรง'), ('mv_bad', 'MOVEMENT ไม่ตรง'),
+              ('mv_review', 'MOVEMENT ต้องตรวจ'), ('tax_bad', 'TAX ID ไม่ตรง')) if TOT[k]]
+    _tot_ok = pe_ok and ge_ok and me_ok
+    trow = [(f'{OK} ยอดรวม ENTER = MANIFEST' if _all_ok
+             else f'{WARN} ยอดรวมตรงกัน แต่มีจุดต้องตรวจ: ' + ', '.join(_flags) if _tot_ok
+             else f'{WARN} ยอดรวมไม่ตรง — ตรวจด่วน'),
             'TOTAL / ยอดรวม',
             f'{na} B/L ย่อย', f'{na} B/L ย่อย',
             f"{len(TOT['cte'])} ตู้: {_ct(TOT['cte'])}", f"{len(TOT['ctm'])} ตู้: {_ct(TOT['ctm'])}",
@@ -2345,7 +2753,7 @@ def build_report(MAN, ENT, vessel, man_declared, ent_declared, outpath):
                            "(DISCHARGE BANGKOK)    ||    " if EXPECTED_SHED else
                            "SHED NO.: USED ENGINE/LAOS=0126/0124 (เฉพาะ DISCHARGE BANGKOK), DG=2826 (เฉพาะ LAEM "
                            "CHABANG), THLKR/BMT/SCT/UNITHAI=0332/0110/0302/0113    ||    ") +
-                        "CARGO MOVEMENT: TRANSIT ต้องเป็น (7-TRANSIT) เสมอ ยกเว้นไปลาวต้องตรงกับ ENTER เท่านั้น")
+                        "CARGO MOVEMENT: TRANSHIPMENT ต้องเป็น (3-TRANSHIPMENT) เสมอ ; TRANSIT ต้องเป็น (7-TRANSIT) เสมอ ยกเว้นไปลาวต้องตรงกับ ENTER เท่านั้น")
     c3.font = Font(name=FN, size=FS, bold=True, color=DKRED)         # แถวที่ 3 = สีแดง
     c3.alignment = Alignment(wrap_text=True, vertical='center')
     ws.row_dimensions[2].height = 18
@@ -2406,7 +2814,9 @@ def main(argv=None):
         sys.exit(f'!! ไม่พบไฟล์ MANIFEST (.xls/.xlsx) — ระบุด้วย --manifest หรือวางไว้ในโฟลเดอร์นี้/input/')
     if not enter or not os.path.exists(enter):
         sys.exit(f'!! ไม่พบไฟล์ ENTER (.pdf) — ระบุด้วย --enter หรือวางไว้ในโฟลเดอร์นี้/input/')
-    outdir = a.outdir or os.path.dirname(manifest) or '.'
+    # ค่าเริ่มต้น: โฟลเดอร์ output/ ข้างโฟลเดอร์ input/ (หรือใน --indir) — ผู้ใช้ต้องการผลไว้ใน output ทุกครั้ง
+    mdir = os.path.dirname(os.path.abspath(manifest))
+    outdir = a.outdir or os.path.join(os.path.dirname(mdir) if os.path.basename(mdir).lower() == 'input' else mdir, 'output')
     os.makedirs(outdir, exist_ok=True)
     outpath = os.path.join(outdir, 'EDI.xlsx')
 
